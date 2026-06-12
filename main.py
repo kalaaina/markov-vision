@@ -1,8 +1,89 @@
 ﻿import base64
 import os
 import struct
+import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import filedialog, messagebox
+
+from PIL import Image, ImageTk, ImageOps
+import numpy as np
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+IMAGE_DISPLAY_SIZE = (420, 420)
+CONTROL_FONT_BOLD = ('Segoe UI', 10, 'bold')
+CONTROL_FONT = ('Segoe UI', 10)
+SLIDER_LENGTH = 220
+BUTTON_PAD_X = 8
+BUTTON_PAD_Y = 8
+
+
+def _labels_to_rgb(labels, n_classes):
+    """Convertit une carte d'étiquettes (H,W) en image RGB (uint8).
+    Utilise une palette fixe adaptée jusqu'à 6 classes.
+    """
+    palette = [
+        [255, 100, 100],
+        [100, 200, 100],
+        [100, 150, 255],
+        [255, 220, 80],
+        [200, 100, 200],
+        [180, 180, 180],
+    ]
+
+    H, W = labels.shape
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+
+    for k in range(min(n_classes, len(palette))):
+        rgb[labels == k] = palette[k]
+
+    # Si plus de classes que la palette, assigner des couleurs aléatoires
+    if n_classes > len(palette):
+        for k in range(len(palette), n_classes):
+            color = np.random.randint(0, 256, size=3)
+            rgb[labels == k] = color
+
+    return rgb
+
+
+def log(msg: str):
+    """Append a timestamped message to the UI log (thread-safe)."""
+    ts = time.strftime('%H:%M:%S')
+
+    def _append():
+        try:
+            log_widget.configure(state='normal')
+            log_widget.insert('end', f'[{ts}] {msg}\n')
+            log_widget.see('end')
+            log_widget.configure(state='disabled')
+        except Exception:
+            pass
+
+    if 'root' in globals():
+        try:
+            root.after(0, _append)
+        except Exception:
+            # fallback to printing
+            print(f'[{ts}] {msg}')
+    else:
+        print(f'[{ts}] {msg}')
+
+
+from config import BETA, TEMPERATURE, N_ITERATIONS, N_CLASSES, IMAGE_SIZE
+
+
+
+# --- Nouveaux imports (Le travail de l'équipe) ---
+import config
+import image_loader
+import initializer
+import gibbs_sampler
+import texture_synth
+import convergence
+
+
 
 ICON_PNG_B64 = (
     'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAQAAAC1+jfqAAAAHklEQVR4AWMYBaNgFIwMDAwGJgYGBgaGhgYGBgAAAwA'
@@ -19,6 +100,10 @@ LANGUAGES = {
         'image': "[ L'image s'affichera ici ]",
         'switch_theme': "Basculer le thème",
         'switch_lang': "EN",
+        'toggle_logs': "Afficher/Cacher les logs",
+        'show_logs': "Afficher logs",
+        'hide_logs': "Cacher logs",
+        'plot_title': "Convergence (Énergie)",
     },
     'en': {
         'beta': "Beta (Cohesion):",
@@ -29,6 +114,10 @@ LANGUAGES = {
         'image': "[ Image will appear here ]",
         'switch_theme': "Toggle Theme",
         'switch_lang': "FR",
+        'toggle_logs': "Toggle logs",
+        'show_logs': "Show logs",
+        'hide_logs': "Hide logs",
+        'plot_title': "Convergence (Energy)",
     },
 }
 
@@ -62,10 +151,165 @@ THEMES = {
 
 def run_workflow_a():
     print('Démarrage du Workflow A...')
+    # Ouvrir un fichier image (si aucun choisi on utilisera une image simulée)
+    path = filedialog.askopenfilename(title='Choisir une image', filetypes=[('Images', '*.png *.jpg *.jpeg *.bmp')])
+    if not path:
+        log('Aucun fichier sélectionné — utilisation d\'une image simulée')
+        H, W = IMAGE_SIZE
+        image_array = np.random.randint(0, 256, (H, W, 3), dtype=np.uint8)
+    else:
+        try:
+            image_array = image_loader.load_image(path)
+        except Exception as e:
+            messagebox.showerror('Erreur', f"Impossible de charger l'image : {e}")
+            return
 
+    # Afficher l'image originale dans la colonne de gauche
+    try:
+        show_energy_plot()
+        im_orig = Image.fromarray(image_array)
+        photo_orig = build_photo_image(im_orig)
+        label_original.configure(image=photo_orig, text='')
+        label_original._img = photo_orig
+    except Exception:
+        pass
+
+    log('Image chargée et affichée (original).')
+
+    # Initialiser les labels
+    try:
+        labels = initializer.init_labels(image_array, N_CLASSES)
+    except Exception as e:
+        messagebox.showerror('Erreur', f"Échec de l'initialisation : {e}")
+        return
+
+    # Récupérer les paramètres UI dynamiquement (valeurs par défaut si non disponibles)
+    beta = float(slider_beta.get()) if 'slider_beta' in globals() else BETA
+    temperature = float(slider_t.get()) if 'slider_t' in globals() else TEMPERATURE
+
+    # Callback pour mise à jour UI (sera appelé depuis un thread)
+    def make_callback(root, label_widget):
+        def _cb(current_labels, iteration):
+            # Convertir labels en image RGB
+            rgb = _labels_to_rgb(current_labels, N_CLASSES)
+            im = Image.fromarray(rgb)
+            photo = build_photo_image(im)
+
+            # Mise à jour via la boucle Tk (sécurité thread)
+            def _update():
+                label_widget.configure(image=photo, text='')
+                label_widget._img = photo
+                status_label.configure(text=f'Itération {iteration}/{N_ITERATIONS}')
+
+            root.after(0, _update)
+
+            # Mettre à jour la courbe d'énergie
+            try:
+                # compute_energy accepte une matrice d'étiquettes
+                e = convergence.compute_energy(current_labels)
+                energy_history.append(e)
+                # Update plot data
+                energy_line.set_data(range(len(energy_history)), energy_history)
+                energy_ax.relim()
+                energy_ax.autoscale_view()
+                energy_canvas.draw_idle()
+            except Exception:
+                pass
+
+        return _cb
+
+    # Lancer Gibbs dans un thread pour ne pas bloquer l'UI
+    def _run():
+        try:
+            log(f'Lancement Gibbs : beta={beta}, T={temperature}, iters={N_ITERATIONS}')
+            final, history = gibbs_sampler.run_gibbs(labels, image_array, beta=beta, temperature=temperature, n_iter=N_ITERATIONS, callback=make_callback(root, label_image))
+            log('Gibbs terminé.')
+            # Afficher la dernière image
+            rgb = _labels_to_rgb(final, N_CLASSES)
+            im = Image.fromarray(rgb)
+            photo = build_photo_image(im)
+
+            def _final_update():
+                label_image.configure(image=photo, text='')
+                label_image._img = photo
+                status_label.configure(text='Terminé')
+                # Afficher la courbe de convergence
+                try:
+                    convergence.plot_convergence(history)
+                except Exception:
+                    pass
+
+            root.after(0, _final_update)
+        except Exception as e:
+            root.after(0, lambda: messagebox.showerror('Erreur', f'Erreur pendant Gibbs: {e}'))
+
+    threading.Thread(target=_run, daemon=True).start()
 
 def run_workflow_b():
     print('Démarrage du Workflow B...')
+    # Choisir un patch source pour synthèse
+    path = filedialog.askopenfilename(title='Choisir un patch source', filetypes=[('Images', '*.png *.jpg *.jpeg *.bmp')])
+    if not path:
+        return
+
+    try:
+        patch = image_loader.load_image(path)
+    except Exception as e:
+        messagebox.showerror('Erreur', f"Impossible de charger le patch : {e}")
+        return
+
+    # Afficher le patch original dans la colonne de gauche
+    hide_energy_plot()
+    try:
+        im_orig = Image.fromarray(patch)
+        photo_orig = build_photo_image(im_orig)
+        label_original.configure(image=photo_orig, text='')
+        label_original._img = photo_orig
+    except Exception:
+        pass
+
+    log(f'Patch chargé: {os.path.basename(path)}')
+
+    # Lancer la synthèse dans un thread et poster des logs
+    def _run_synth():
+        try:
+            log('Démarrage de la synthèse...')
+            # Capture les prints internes de texture_synth et les redirige vers le log UI
+            import sys
+
+            class _StdoutToLog:
+                def write(self, s):
+                    s = s.strip()
+                    if s:
+                        log(s)
+                def flush(self):
+                    pass
+
+            _old_stdout = sys.stdout
+            sys.stdout = _StdoutToLog()
+            try:
+                labels = texture_synth.synthesize_texture(patch, output_size=IMAGE_SIZE, beta=slider_beta.get() if 'slider_beta' in globals() else BETA, T=slider_t.get() if 'slider_t' in globals() else TEMPERATURE)
+            finally:
+                sys.stdout = _old_stdout
+
+            log('Synthèse terminée.')
+
+            rgb = _labels_to_rgb(labels, max(2, np.unique(labels).size))
+            im = Image.fromarray(rgb)
+            photo = ImageTk.PhotoImage(im)
+
+            def _update_ui():
+                label_image.configure(image=photo, text='')
+                label_image._img = photo
+                status_label.configure(text='Terminé')
+
+            root.after(0, _update_ui)
+        except Exception as e:
+            log(f'Erreur pendant la synthèse: {e}')
+            root.after(0, lambda: messagebox.showerror('Erreur', f"Erreur pendant la synthèse : {e}"))
+
+    threading.Thread(target=_run_synth, daemon=True).start()
+    return
 
 
 def ensure_icon_file(icon_path: str) -> str | None:
@@ -100,31 +344,114 @@ def apply_window_icon(root: tk.Tk):
         pass
 
 
+def resize_for_display(image: Image.Image) -> Image.Image:
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    return ImageOps.contain(image, IMAGE_DISPLAY_SIZE, Image.LANCZOS)
+
+
+def build_photo_image(image: Image.Image) -> ImageTk.PhotoImage:
+    return ImageTk.PhotoImage(resize_for_display(image))
+
+
+def show_energy_plot():
+    try:
+        global plot_frame, energy_line, energy_canvas
+        energy_line.set_visible(True)
+        plot_frame.grid()
+        energy_canvas.draw_idle()
+    except Exception:
+        pass
+
+
+def hide_energy_plot():
+    try:
+        global plot_frame, energy_line, energy_canvas
+        energy_line.set_visible(False)
+        plot_frame.grid_remove()
+        energy_canvas.draw_idle()
+    except Exception:
+        pass
+
+
 def create_ui():
     print('Creating UI...')
+    global slider_beta, slider_t, label_image, label_original, status_label, root, log_widget
+    global energy_fig, energy_ax, energy_canvas, energy_line, energy_history, plot_frame
     root = tk.Tk()
     root.title('Markov-Vision')
-    root.geometry('720x820')
-    root.minsize(560, 640)
+    root.geometry('860x760')
+    root.minsize(680, 660)
     apply_window_icon(root)
     root.configure(bg=THEMES['dark']['root_bg'])
     root.deiconify()
     root.lift()
     root.attributes('-topmost', True)
     root.after(200, lambda: root.attributes('-topmost', False))
+    # Start maximized so the UI fills the screen; user can restore if desired
+    try:
+        root.state('zoomed')
+    except Exception:
+        pass
     root.columnconfigure(0, weight=1)
+    root.columnconfigure(1, weight=0)
     root.rowconfigure(0, weight=1)
 
-    main_frame = tk.Frame(root, padx=16, pady=16, bg=THEMES['dark']['main_bg'])
+    # Scrollable container for the entire UI to avoid layout clipping on small windows
+    canvas = tk.Canvas(root, bg=THEMES['dark']['root_bg'], highlightthickness=0)
+    vscroll = tk.Scrollbar(root, orient='vertical', command=canvas.yview)
+    canvas.configure(yscrollcommand=vscroll.set)
+    canvas.grid(row=0, column=0, sticky='nsew')
+    vscroll.grid(row=0, column=1, sticky='ns')
+
+    # Content frame placed inside canvas
+    content = tk.Frame(canvas, bg=THEMES['dark']['main_bg'])
+    window_id = canvas.create_window((0, 0), window=content, anchor='nw')
+
+    # Allow the content frame to expand to fill the canvas window
+    try:
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(0, weight=1)
+    except Exception:
+        pass
+
+    def _on_content_config(event):
+        canvas.configure(scrollregion=canvas.bbox('all'))
+
+    content.bind('<Configure>', _on_content_config)
+
+    # Ensure content width matches canvas width on resize
+    def _on_canvas_config(event):
+        try:
+            canvas.itemconfig(window_id, width=event.width)
+        except Exception:
+            pass
+
+    canvas.bind('<Configure>', _on_canvas_config)
+
+    main_frame = tk.Frame(content, padx=12, pady=12, bg=THEMES['dark']['main_bg'])
     main_frame.grid(row=0, column=0, sticky='nsew')
     main_frame.columnconfigure(0, weight=1)
-    main_frame.rowconfigure(0, weight=3)
+    main_frame.rowconfigure(0, weight=5)
     main_frame.rowconfigure(1, weight=2)
 
+    # Image frame: two columns -> original (left) and result (right)
     image_frame = tk.Frame(main_frame, bd=0, relief='flat', bg=THEMES['dark']['frame_bg'])
     image_frame.grid(row=0, column=0, sticky='nsew', padx=4, pady=(0, 10))
     image_frame.columnconfigure(0, weight=1)
+    image_frame.columnconfigure(1, weight=1)
     image_frame.rowconfigure(0, weight=1)
+
+    label_original = tk.Label(
+        image_frame,
+        text='Original',
+        bg=THEMES['dark']['frame_bg'],
+        fg=THEMES['dark']['fg'],
+        anchor='center',
+        justify='center',
+        font=('Segoe UI', 12, 'bold'),
+    )
+    label_original.grid(row=0, column=0, sticky='nsew', padx=8, pady=8)
 
     label_image = tk.Label(
         image_frame,
@@ -135,7 +462,7 @@ def create_ui():
         justify='center',
         font=('Segoe UI', 14, 'bold'),
     )
-    label_image.grid(row=0, column=0, sticky='nsew', padx=10, pady=10)
+    label_image.grid(row=0, column=1, sticky='nsew', padx=8, pady=8)
 
     controls_frame = tk.Frame(main_frame, bg=THEMES['dark']['main_bg'])
     controls_frame.grid(row=1, column=0, sticky='nsew')
@@ -146,6 +473,7 @@ def create_ui():
     toolbar.columnconfigure(0, weight=0)
     toolbar.columnconfigure(1, weight=1)
     toolbar.columnconfigure(2, weight=0)
+    toolbar.columnconfigure(3, weight=0)
 
     icon_canvas = tk.Canvas(toolbar, width=26, height=26, highlightthickness=0, bg=THEMES['dark']['main_bg'])
     icon_canvas.grid(row=0, column=0, sticky='w', padx=(0, 8))
@@ -158,8 +486,57 @@ def create_ui():
     lang_toggle_btn = tk.Button(toolbar, text=LANGUAGES['fr']['switch_lang'], bd=0, padx=8, pady=6)
     lang_toggle_btn.grid(row=0, column=2, sticky='e')
 
-    label_beta = tk.Label(controls_frame, text=LANGUAGES['fr']['beta'], anchor='w', fg=THEMES['dark']['fg'], bg=THEMES['dark']['main_bg'], font=('Segoe UI', 11, 'bold'))
-    label_beta.grid(row=1, column=0, sticky='ew', pady=(0, 4))
+    logs_toggle_btn = tk.Button(toolbar, text=LANGUAGES['fr']['toggle_logs'], bd=0, padx=8, pady=6)
+    logs_toggle_btn.grid(row=0, column=3, sticky='e', padx=(8,0))
+
+    # Matplotlib plot area for energy convergence (above sliders)
+    plot_frame = tk.Frame(controls_frame, bg=THEMES['dark']['main_bg'])
+    plot_frame.grid(row=1, column=0, sticky='ew', pady=(0, 12))
+    plot_frame.columnconfigure(0, weight=1)
+
+    # Create empty figure and canvas
+    energy_history = []
+    energy_fig = Figure(figsize=(6, 1.0), dpi=100, facecolor=THEMES['dark']['main_bg'], constrained_layout=True)
+    energy_ax = energy_fig.add_subplot(111)
+    energy_ax.set_facecolor(THEMES['dark']['frame_bg'])
+    energy_ax.plot([], [])
+    energy_ax.set_title('Convergence (Énergie)', color=THEMES['dark']['fg'])
+    energy_ax.tick_params(colors=THEMES['dark']['fg'])
+    energy_ax.spines['bottom'].set_color('#444')
+    energy_ax.spines['left'].set_color('#444')
+    energy_line, = energy_ax.plot([], [], color='#3c82f6', marker='.', linewidth=2)
+
+    energy_canvas = FigureCanvasTkAgg(energy_fig, master=plot_frame)
+    energy_canvas.draw()
+    energy_canvas.get_tk_widget().grid(row=0, column=0, sticky='nsew')
+    plot_frame.rowconfigure(0, weight=1)
+    # plot_frame is hidden by default; allow it to expand when shown
+    plot_frame.grid_remove()
+
+    # Resize the matplotlib figure when the plot_frame size changes so title and axes scale
+    def _on_plot_resize(event):
+        try:
+            dpi = energy_fig.dpi or 100
+            w_in = max(1.0, event.width / dpi)
+            h_in = max(0.5, event.height / dpi)
+            energy_fig.set_size_inches(w_in, h_in)
+            # nudge title to avoid clipping and recompute layout
+            try:
+                energy_ax.title.set_y(1.05)
+            except Exception:
+                pass
+            try:
+                energy_fig.tight_layout()
+            except Exception:
+                pass
+            energy_canvas.draw_idle()
+        except Exception:
+            pass
+
+    plot_frame.bind('<Configure>', _on_plot_resize)
+
+    label_beta = tk.Label(controls_frame, text=LANGUAGES['fr']['beta'], anchor='w', fg=THEMES['dark']['fg'], bg=THEMES['dark']['main_bg'], font=CONTROL_FONT_BOLD)
+    label_beta.grid(row=2, column=0, sticky='ew', pady=(0, 4))
 
     slider_beta = tk.Scale(
         controls_frame,
@@ -167,16 +544,19 @@ def create_ui():
         to=5.0,
         resolution=0.1,
         orient=tk.HORIZONTAL,
+        length=SLIDER_LENGTH,
+        font=CONTROL_FONT,
         bg=THEMES['dark']['main_bg'],
         fg=THEMES['dark']['fg'],
         troughcolor=THEMES['dark']['trough'],
         highlightthickness=0,
+        bd=0,
     )
     slider_beta.set(1.5)
-    slider_beta.grid(row=2, column=0, sticky='ew')
+    slider_beta.grid(row=3, column=0, sticky='ew')
 
-    label_t = tk.Label(controls_frame, text=LANGUAGES['fr']['temperature'], anchor='w', fg=THEMES['dark']['fg'], bg=THEMES['dark']['main_bg'], font=('Segoe UI', 11, 'bold'))
-    label_t.grid(row=3, column=0, sticky='ew', pady=(12, 4))
+    label_t = tk.Label(controls_frame, text=LANGUAGES['fr']['temperature'], anchor='w', fg=THEMES['dark']['fg'], bg=THEMES['dark']['main_bg'], font=CONTROL_FONT_BOLD)
+    label_t.grid(row=4, column=0, sticky='ew', pady=(12, 4))
 
     slider_t = tk.Scale(
         controls_frame,
@@ -184,19 +564,27 @@ def create_ui():
         to=5.0,
         resolution=0.1,
         orient=tk.HORIZONTAL,
+        length=SLIDER_LENGTH,
+        font=CONTROL_FONT,
         bg=THEMES['dark']['main_bg'],
         fg=THEMES['dark']['fg'],
         troughcolor=THEMES['dark']['trough'],
         highlightthickness=0,
+        bd=0,
     )
     slider_t.set(1.0)
-    slider_t.grid(row=4, column=0, sticky='ew')
+    slider_t.grid(row=5, column=0, sticky='ew')
 
-    btn_font_a = tkfont.Font(family='Segoe UI', size=11, weight='bold')
-    btn_font_b = tkfont.Font(family='Segoe UI', size=11, weight='bold')
+    button_frame = tk.Frame(controls_frame, bg=THEMES['dark']['main_bg'])
+    button_frame.grid(row=6, column=0, sticky='ew', pady=(16, 5))
+    button_frame.columnconfigure(0, weight=1)
+    button_frame.columnconfigure(1, weight=1)
+
+    btn_font_a = tkfont.Font(family='Segoe UI', size=10, weight='bold')
+    btn_font_b = tkfont.Font(family='Segoe UI', size=10, weight='bold')
 
     btn_a = tk.Button(
-        controls_frame,
+        button_frame,
         text=LANGUAGES['fr']['workflow_a'],
         command=run_workflow_a,
         bg=THEMES['dark']['primary'],
@@ -204,14 +592,14 @@ def create_ui():
         activebackground=THEMES['dark']['primary_hover'],
         activeforeground='#ffffff',
         bd=0,
-        padx=10,
-        pady=10,
+        padx=BUTTON_PAD_X,
+        pady=BUTTON_PAD_Y,
         font=btn_font_a,
     )
-    btn_a.grid(row=5, column=0, sticky='ew', pady=(16, 5))
+    btn_a.grid(row=0, column=0, sticky='ew', padx=(0, 4))
 
     btn_b = tk.Button(
-        controls_frame,
+        button_frame,
         text=LANGUAGES['fr']['workflow_b'],
         command=run_workflow_b,
         bg=THEMES['dark']['secondary'],
@@ -219,20 +607,39 @@ def create_ui():
         activebackground=THEMES['dark']['secondary_hover'],
         activeforeground='#ffffff',
         bd=0,
-        padx=10,
-        pady=10,
+        padx=BUTTON_PAD_X,
+        pady=BUTTON_PAD_Y,
         font=btn_font_b,
     )
-    btn_b.grid(row=6, column=0, sticky='ew', pady=(0, 5))
+    btn_b.grid(row=0, column=1, sticky='ew')
 
-    status_label = tk.Label(root, text=LANGUAGES['fr']['status'], anchor='w', fg=THEMES['dark']['status_fg'], bg=THEMES['dark']['root_bg'], font=('Segoe UI', 9))
-    status_label.grid(row=1, column=0, sticky='ew', padx=12, pady=(0, 12))
+    # Zone de logs (multi-lignes) placée au-dessus du libellé de statut
+    log_frame = tk.Frame(content, bg=THEMES['dark']['root_bg'])
+    log_frame.grid(row=1, column=0, sticky='nsew', padx=12, pady=(6, 6))
+    log_frame.columnconfigure(0, weight=1)
+    # Fixer une hauteur réduite pour éviter d'écraser les contrôles
+    log_frame.configure(height=120)
+    log_frame.grid_propagate(False)
+
+    log_scroll = tk.Scrollbar(log_frame)
+    log_scroll.grid(row=0, column=1, sticky='ns')
+
+    log_widget = tk.Text(log_frame, height=4, bg=THEMES['dark']['frame_bg'], fg=THEMES['dark']['fg'], wrap='word', yscrollcommand=log_scroll.set)
+    log_widget.grid(row=0, column=0, sticky='nsew')
+    log_widget.configure(state='disabled', padx=6, pady=6)
+    log_scroll.config(command=log_widget.yview)
+
+    status_label = tk.Label(content, text=LANGUAGES['fr']['status'], anchor='w', fg=THEMES['dark']['status_fg'], bg=THEMES['dark']['root_bg'], font=('Segoe UI', 9))
+    status_label.grid(row=2, column=0, sticky='ew', padx=12, pady=(0, 12))
+
+    # log_widget est déclaré global en tête de la fonction
 
     current_theme = {'name': 'dark'}
     current_lang = {'code': 'fr'}
 
     def apply_theme(name: str):
         t = THEMES[name]
+        spine_color = '#444' if name == 'dark' else '#888'
         root.configure(bg=t['root_bg'])
         main_frame.configure(bg=t['main_bg'])
         image_frame.configure(bg=t['frame_bg'])
@@ -248,6 +655,17 @@ def create_ui():
         btn_b.configure(bg=t['secondary'], activebackground=t['secondary_hover'])
         status_label.configure(bg=t['root_bg'], fg=t['status_fg'])
         icon_canvas.itemconfig(icon_circle, fill=t['primary'])
+        energy_fig.set_facecolor(t['main_bg'])
+        try:
+            logs_toggle_btn.configure(bg=t['main_bg'], fg=t['fg'])
+        except Exception:
+            pass
+        energy_ax.set_facecolor(t['frame_bg'])
+        energy_ax.set_title(LANGUAGES[current_lang['code']]['plot_title'], color=t['fg'])
+        energy_ax.tick_params(colors=t['fg'])
+        energy_ax.spines['bottom'].set_color(spine_color)
+        energy_ax.spines['left'].set_color(spine_color)
+        energy_canvas.draw_idle()
 
     def set_language(code: str):
         lang = LANGUAGES[code]
@@ -259,7 +677,23 @@ def create_ui():
         label_image.configure(text=lang['image'])
         theme_toggle_btn.configure(text=lang['switch_theme'])
         lang_toggle_btn.configure(text=lang['switch_lang'])
+        energy_ax.set_title(lang['plot_title'], color=THEMES[current_theme['name']]['fg'])
+        try:
+            logs_toggle_btn.configure(text=lang['toggle_logs'])
+        except Exception:
+            pass
+        energy_canvas.draw_idle()
 
+    def toggle_logs():
+        try:
+            if log_frame.winfo_viewable():
+                log_frame.grid_remove()
+                logs_toggle_btn.configure(text=LANGUAGES[current_lang['code']]['show_logs'])
+            else:
+                log_frame.grid()
+                logs_toggle_btn.configure(text=LANGUAGES[current_lang['code']]['hide_logs'])
+        except Exception:
+            pass
     def toggle_theme():
         current_theme['name'] = 'light' if current_theme['name'] == 'dark' else 'dark'
         apply_theme(current_theme['name'])
@@ -286,6 +720,10 @@ def create_ui():
     btn_b.bind('<Leave>', on_leave_b)
     theme_toggle_btn.configure(command=toggle_theme)
     lang_toggle_btn.configure(command=toggle_lang)
+    try:
+        logs_toggle_btn.configure(command=toggle_logs)
+    except Exception:
+        pass
 
     apply_theme(current_theme['name'])
     set_language(current_lang['code'])

@@ -1,4 +1,4 @@
-﻿import base64
+import base64
 import os
 import struct
 import threading
@@ -83,6 +83,15 @@ import gibbs_sampler
 import texture_synth
 import convergence
 
+# --- Variables d'état globales pour le live update ---
+current_image = None       # Image originale NumPy
+initial_labels = None      # Labels de départ (K-means)
+current_labels = None      # Labels au cours du Gibbs
+gibbs_thread = None        # Référence vers le thread Gibbs actif
+abort_event = threading.Event()  # Événement d'annulation du thread
+debounce_timer = None      # ID du timer de debouncing Tkinter
+
+
 
 
 ICON_PNG_B64 = (
@@ -149,9 +158,145 @@ THEMES = {
 }
 
 
+def make_callback(root, label_widget):
+    """Crée le callback thread-safe pour mettre à jour la segmentation et le tracé de convergence en direct."""
+    def _cb(current_labels, iteration):
+        if abort_event.is_set():
+            return
+            
+        # Convertir les labels actuels en image RGB pour l'affichage
+        rgb = _labels_to_rgb(current_labels, N_CLASSES)
+        im = Image.fromarray(rgb)
+        photo = build_photo_image(im)
+
+        # Mise à jour de l'image de segmentation et du statut via root.after (sécurité thread)
+        def _update():
+            if abort_event.is_set():
+                return
+            label_widget.configure(image=photo, text='')
+            label_widget._img = photo
+            status_label.configure(text=f'Itération {iteration}/{N_ITERATIONS}')
+
+        root.after(0, _update)
+
+        # Calculer et mettre à jour la courbe d'énergie
+        try:
+            # On utilise le beta en cours (lu depuis le slider de façon dynamique)
+            current_beta = float(slider_beta.get()) if 'slider_beta' in globals() else BETA
+            e = convergence.compute_energy(current_labels, beta=current_beta)
+            energy_history.append(e)
+            
+            # Mise à jour du graphique dans le thread principal de Tkinter (indispensable pour éviter les crashs)
+            def _update_plot():
+                if abort_event.is_set():
+                    return
+                energy_line.set_data(range(len(energy_history)), energy_history)
+                energy_ax.relim()
+                energy_ax.autoscale_view()
+                energy_canvas.draw_idle()
+                
+            root.after(0, _update_plot)
+        except Exception:
+            pass
+
+    return _cb
+
+
+def trigger_live_gibbs():
+    """Gère l'annulation du thread Gibbs en cours et lance un nouveau thread avec les paramètres actuels."""
+    global gibbs_thread, abort_event, energy_history
+    
+    if current_image is None or initial_labels is None:
+        return
+        
+    # Étape 1 : Signaler à l'ancien thread de s'arrêter
+    abort_event.set()
+    
+    # Étape 2 : Attendre que l'ancien thread ait fini de s'interrompre (non-bloquant ou très court)
+    if gibbs_thread is not None and gibbs_thread.is_alive():
+        gibbs_thread.join(timeout=0.25)
+        
+    # Étape 3 : Réinitialiser le signal d'annulation pour le nouveau run
+    abort_event.clear()
+    
+    # Étape 4 : Réinitialiser la courbe d'énergie
+    energy_history = []
+    
+    # Récupérer les valeurs actuelles des sliders
+    beta = float(slider_beta.get()) if 'slider_beta' in globals() else BETA
+    temperature = float(slider_t.get()) if 'slider_t' in globals() else TEMPERATURE
+    
+    # Callback thread-safe pour les mises à jour graphiques en direct
+    cb = make_callback(root, label_image)
+    
+    # Étape 5 : Fonction d'exécution en tâche de fond (Thread)
+    def _run_live():
+        try:
+            log(f'Lancement Gibbs live : beta={beta}, T={temperature}, iters={N_ITERATIONS}')
+            # On utilise le mode vectorisé (vectorized=True) pour garantir le temps réel (15ms/iter)
+            final, history = gibbs_sampler.run_gibbs(
+                initial_labels.copy(),
+                current_image,
+                beta=beta,
+                temperature=temperature,
+                n_iter=N_ITERATIONS,
+                callback=cb,
+                vectorized=True,
+                n_classes=N_CLASSES
+            )
+            
+            if not abort_event.is_set():
+                log('Gibbs terminé avec succès.')
+                # Affichage de l'image finale
+                rgb = _labels_to_rgb(final, N_CLASSES)
+                im = Image.fromarray(rgb)
+                photo = build_photo_image(im)
+                
+                def _final_update():
+                    if abort_event.is_set():
+                        return
+                    label_image.configure(image=photo, text='')
+                    label_image._img = photo
+                    status_label.configure(text='Terminé')
+                    
+                root.after(0, _final_update)
+        except Exception as e:
+            if not abort_event.is_set():
+                log(f'Erreur dans Gibbs live : {e}')
+                root.after(0, lambda: messagebox.showerror('Erreur', f'Erreur Gibbs live : {e}'))
+
+    # Démarrage du thread en tâche de fond (daemon pour quitter proprement avec l'app)
+    gibbs_thread = threading.Thread(target=_run_live, daemon=True)
+    gibbs_thread.start()
+
+
+def on_slider_changed(val=None):
+    """Fonction de rappel appelée lors du mouvement des curseurs Beta/Température.
+    Implémente un debouncing de 200ms pour éviter de surcharger le processeur.
+    """
+    global debounce_timer
+    
+    # Si aucune image n'est chargée, inutile de lancer l'algorithme
+    if current_image is None or initial_labels is None:
+        return
+        
+    # Annuler le timer en cours pour recommencer le debouncing
+    if debounce_timer is not None:
+        try:
+            root.after_cancel(debounce_timer)
+        except Exception:
+            pass
+            
+    # Planifier le lancement dynamique de Gibbs dans 200 ms
+    debounce_timer = root.after(200, trigger_live_gibbs)
+
+
 def run_workflow_a():
+    """Charge une image, initialise ses labels via K-means, et lance le premier run interactif."""
+    global current_image, initial_labels, current_labels
     print('Démarrage du Workflow A...')
-    # Ouvrir un fichier image (si aucun choisi on utilisera une image simulée)
+    
+    # Sélection du fichier image
     path = filedialog.askopenfilename(title='Choisir une image', filetypes=[('Images', '*.png *.jpg *.jpeg *.bmp')])
     if not path:
         log('Aucun fichier sélectionné — utilisation d\'une image simulée')
@@ -176,74 +321,20 @@ def run_workflow_a():
 
     log('Image chargée et affichée (original).')
 
-    # Initialiser les labels
+    # Initialisation des labels par K-means maison
     try:
         labels = initializer.init_labels(image_array, N_CLASSES)
     except Exception as e:
         messagebox.showerror('Erreur', f"Échec de l'initialisation : {e}")
         return
 
-    # Récupérer les paramètres UI dynamiquement (valeurs par défaut si non disponibles)
-    beta = float(slider_beta.get()) if 'slider_beta' in globals() else BETA
-    temperature = float(slider_t.get()) if 'slider_t' in globals() else TEMPERATURE
+    # Sauvegarder les données de base pour permettre les mises à jour interactives en direct
+    current_image = image_array
+    initial_labels = labels
+    current_labels = labels.copy()
 
-    # Callback pour mise à jour UI (sera appelé depuis un thread)
-    def make_callback(root, label_widget):
-        def _cb(current_labels, iteration):
-            # Convertir labels en image RGB
-            rgb = _labels_to_rgb(current_labels, N_CLASSES)
-            im = Image.fromarray(rgb)
-            photo = build_photo_image(im)
-
-            # Mise à jour via la boucle Tk (sécurité thread)
-            def _update():
-                label_widget.configure(image=photo, text='')
-                label_widget._img = photo
-                status_label.configure(text=f'Itération {iteration}/{N_ITERATIONS}')
-
-            root.after(0, _update)
-
-            # Mettre à jour la courbe d'énergie
-            try:
-                # compute_energy accepte une matrice d'étiquettes
-                e = convergence.compute_energy(current_labels)
-                energy_history.append(e)
-                # Update plot data
-                energy_line.set_data(range(len(energy_history)), energy_history)
-                energy_ax.relim()
-                energy_ax.autoscale_view()
-                energy_canvas.draw_idle()
-            except Exception:
-                pass
-
-        return _cb
-
-    # Lancer Gibbs dans un thread pour ne pas bloquer l'UI
-    def _run():
-        try:
-            log(f'Lancement Gibbs : beta={beta}, T={temperature}, iters={N_ITERATIONS}')
-            final, history = gibbs_sampler.run_gibbs(labels, image_array, beta=beta, temperature=temperature, n_iter=N_ITERATIONS, callback=make_callback(root, label_image))
-            log('Gibbs terminé.')
-            # Afficher la dernière image
-            rgb = _labels_to_rgb(final, N_CLASSES)
-            im = Image.fromarray(rgb)
-            photo = build_photo_image(im)
-
-            def _final_update():
-                label_image.configure(image=photo, text='')
-                label_image._img = photo
-                status_label.configure(text='Terminé')
-                # Afficher la courbe de convergence
-                try:
-                    convergence.plot_convergence(history)
-                except Exception:
-                    pass
-
-            root.after(0, _final_update)
-        except Exception as e:
-            root.after(0, lambda: messagebox.showerror('Erreur', f'Erreur pendant Gibbs: {e}'))
-
-    threading.Thread(target=_run, daemon=True).start()
+    # Déclencher le premier traitement de segmentation
+    trigger_live_gibbs()
 
 def run_workflow_b():
     print('Démarrage du Workflow B...')
@@ -294,9 +385,12 @@ def run_workflow_b():
 
             log('Synthèse terminée.')
 
-            rgb = _labels_to_rgb(labels, max(2, np.unique(labels).size))
-            im = Image.fromarray(rgb)
+            result_image = np.uint8(labels) 
+            
+            im = Image.fromarray(result_image)
             photo = ImageTk.PhotoImage(im)
+
+            
 
             def _update_ui():
                 label_image.configure(image=photo, text='')
@@ -551,6 +645,7 @@ def create_ui():
         troughcolor=THEMES['dark']['trough'],
         highlightthickness=0,
         bd=0,
+        command=on_slider_changed
     )
     slider_beta.set(1.5)
     slider_beta.grid(row=3, column=0, sticky='ew')
@@ -571,6 +666,7 @@ def create_ui():
         troughcolor=THEMES['dark']['trough'],
         highlightthickness=0,
         bd=0,
+        command=on_slider_changed
     )
     slider_t.set(1.0)
     slider_t.grid(row=5, column=0, sticky='ew')

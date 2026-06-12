@@ -1,34 +1,3 @@
-# =============================================================================
-# texture_synth.py — Student 4 : TANTELINIAINA Sarah
-# Rôle : Workflow B — Générer une grande texture à partir d'un petit patch source
-# =============================================================================
-#
-# CE DONT TU AS BESOIN DES AUTRES :
-#
-#   → De S3 (SIOU) — gibbs_sampler.py :
-#       La fonction : gibbs_step(labels, image, beta, T) → ndarray
-#       Ce qu'elle fait : une itération de Gibbs sur toute l'image
-#       Comment l'importer : from gibbs_sampler import gibbs_step
-#
-#   → De S1 (ICHI) — image_loader.py :
-#       La fonction : load_image(path) → ndarray de shape (H, W, 3)
-#       Ce qu'elle fait : ouvre une image et retourne un tableau NumPy
-#       Tu en as besoin pour charger le patch source depuis un fichier
-#       Comment l'importer : from image_loader import load_image
-#
-#   → config.py (tout le monde) :
-#       Les constantes BETA, TEMPERATURE, N_ITERATIONS, IMAGE_SIZE
-#
-# CE QUE TU LIVRES AUX AUTRES :
-#
-#   → À S6 (ANDRIASAHY) — main.py :
-#       La fonction : synthesize_texture(source_patch, output_size, beta, T)
-#       Il l'appellera quand l'utilisateur clique sur "Workflow B"
-#       Il te donnera : un ndarray (le patch), une taille (ex: (128,128)), beta et T
-#       Il attend en retour : un ndarray (128, 128) avec les labels de la texture générée
-#
-# =============================================================================
-
 import numpy as np
 
 # On importe les constantes partagées
@@ -44,30 +13,6 @@ from gibbs_sampler import gibbs_step
 # =============================================================================
 
 def synthesize_texture(source_patch, output_size=(128, 128), beta=BETA, T=TEMPERATURE):
-    """
-    Génère une grande texture cohérente à partir d'un petit patch source.
-
-    Paramètres :
-        source_patch (ndarray) : petit tableau NumPy (H, W) ou (H, W, 3)
-                                 représentant la texture à reproduire.
-                                 Exemple : 32x32 pixels de brique ou d'herbe.
-        output_size  (tuple)   : taille de la texture à générer, ex: (128, 128)
-        beta         (float)   : force de cohésion entre pixels voisins (depuis config)
-        T            (float)   : température de relaxation (depuis config)
-
-    Retourne :
-        ndarray de shape output_size contenant les labels de la texture générée.
-        Chaque pixel a une valeur entre 0 et n_classes-1.
-    """
-
-    # ------------------------------------------------------------------
-    # ÉTAPE 1 : Analyser le patch source
-    # On regarde combien de classes (couleurs/niveaux) sont présentes
-    # dans le petit patch. C'est notre "alphabet visuel".
-    # ------------------------------------------------------------------
-
-    # Si le patch est en couleur (3 canaux), on le convertit en niveaux de gris
-    # pour simplifier : on n'a plus qu'un seul nombre par pixel
     if source_patch.ndim == 3:
         # Formule standard luminosité : 0.299*R + 0.587*G + 0.114*B
         patch_gray = (0.299 * source_patch[:, :, 0] +
@@ -101,34 +46,19 @@ def synthesize_texture(source_patch, output_size=(128, 128), beta=BETA, T=TEMPER
 
     print(f"[Texture] Canevas vierge créé : {canvas_labels.shape} (bruit aléatoire)")
 
-    # ------------------------------------------------------------------
-    # ÉTAPE 3 : Construire une "image de référence" pour le Gibbs
-    # La fonction gibbs_step de S3 a besoin d'une image en entrée
-    # pour calculer l'énergie. On crée une image synthétique
-    # en "carrelant" le patch source sur toute la grande taille.
-    # C'est ce qui force le Gibbs à reproduire les motifs du patch.
-    # ------------------------------------------------------------------
+
 
     reference_image = _tile_patch_to_size(patch_labels, output_size)
 
-    # On convertit en uint8 sur 3 canaux pour être compatible avec gibbs_step
-    # (S3 attend un ndarray de shape (H, W, 3))
     reference_image_rgb = _labels_to_rgb(reference_image, n_classes)
 
     print(f"[Texture] Image de référence construite par carrelage du patch")
 
-    # ------------------------------------------------------------------
-    # ÉTAPE 4 : Appliquer la Synthèse Markovienne (boucle de Gibbs)
-    # On fait tourner l'algorithme de S3 sur N_ITERATIONS itérations.
-    # Chaque itération : chaque pixel "négocie" sa classe avec ses voisins.
-    # Résultat : le bruit s'organise en structures cohérentes.
-    # ------------------------------------------------------------------
 
     labels = canvas_labels.copy()
 
     for i in range(N_ITERATIONS):
         # Appel à la fonction de S3 — c'est elle qui fait le vrai travail
-        # ⚠️  S3 doit avoir terminé gibbs_step() pour que ça marche
         labels = gibbs_step(labels, reference_image_rgb, beta, T)
 
         # Affichage de progression toutes les 5 itérations
@@ -211,15 +141,6 @@ def _tile_patch_to_size(patch_labels, output_size):
 
 
 def _labels_to_rgb(labels, n_classes):
-    """
-    Convertit une carte de labels (H, W) en image RGB (H, W, 3)
-    pour être compatible avec gibbs_step() de S3.
-
-    Chaque label reçoit une couleur unique (palette fixe).
-
-    ⚠️  S3 (SIOU) : ta fonction gibbs_step attend un ndarray (H, W, 3) dtype uint8.
-        Cette fonction produit exactement ce format.
-    """
     H, W = labels.shape
     rgb = np.zeros((H, W, 3), dtype=np.uint8)
 
@@ -240,14 +161,6 @@ def _labels_to_rgb(labels, n_classes):
 
 
 def _compute_local_energy(labels, beta):
-    """
-    Calcule une approximation rapide de l'énergie globale.
-    Utilisée juste pour afficher la progression — pas pour le Gibbs lui-même.
-    La vraie version détaillée est dans convergence.py de S5.
-
-    Énergie = nombre de paires de voisins qui ont des classes DIFFÉRENTES.
-    Plus c'est bas, plus l'image est cohérente (zones bien formées).
-    """
     # Comparer chaque pixel avec son voisin de droite
     h_diff = np.sum(labels[:, :-1] != labels[:, 1:])
     # Comparer chaque pixel avec son voisin du bas
@@ -320,7 +233,3 @@ if __name__ == "__main__":
     plt.savefig("test_texture_output.png", dpi=100, bbox_inches="tight")
     print("\nImage de test sauvegardée : test_texture_output.png")
     plt.show()
-
-    print("\n✅  Si tu vois 2 images avec des zones cohérentes (pas du bruit pur) → OK !")
-    print("✅  Si le shape est (128, 128) → OK !")
-    print("✅  Ta partie est prête pour S6.")

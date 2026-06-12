@@ -256,9 +256,11 @@ def trigger_live_gibbs():
     # Étape 1 : Signaler à l'ancien thread de s'arrêter
     abort_event.set()
     
-    # Étape 2 : Attendre que l'ancien thread ait fini de s'interrompre (non-bloquant ou très court)
+    # Étape 2 : Vérification non-bloquante et asynchrone si le thread précédent tourne encore
     if gibbs_thread is not None and gibbs_thread.is_alive():
-        gibbs_thread.join(timeout=0.25)
+        # Reporter le démarrage de 50ms et quitter (évite de bloquer la boucle Tkinter et prévient les threads concurrents)
+        root.after(50, trigger_live_gibbs)
+        return
         
     # Étape 3 : Réinitialiser le signal d'annulation pour le nouveau run
     abort_event.clear()
@@ -394,9 +396,11 @@ def trigger_live_synth():
     # Étape 1 : Signaler à l'ancien thread de s'arrêter
     abort_event.set()
     
-    # Étape 2 : Attendre que l'ancien thread se termine (court délai)
+    # Étape 2 : Vérification non-bloquante et asynchrone si le thread précédent tourne encore
     if gibbs_thread is not None and gibbs_thread.is_alive():
-        gibbs_thread.join(timeout=0.25)
+        # Reporter le démarrage de 50ms et quitter (évite de bloquer la boucle Tkinter et prévient les threads concurrents)
+        root.after(50, trigger_live_synth)
+        return
         
     # Étape 3 : Réinitialiser l'événement d'annulation
     abort_event.clear()

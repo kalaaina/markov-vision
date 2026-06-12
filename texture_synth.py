@@ -4,7 +4,6 @@ import numpy as np
 from config import BETA, TEMPERATURE, N_ITERATIONS, IMAGE_SIZE
 
 # On importe le coeur de l'algorithme codé par S3
-# ⚠️  Si S3 n'a pas encore fini, commenter cette ligne et utiliser le stub en bas
 from gibbs_sampler import gibbs_step
 
 

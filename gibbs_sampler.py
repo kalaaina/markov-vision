@@ -95,9 +95,7 @@ def run_gibbs(labels, image, beta=BETA, temperature=TEMPERATURE, n_iter=30,
     return current, history
 
 
-# ===========================================================================
-# TEST INDEPENDANT — à lancer directement : python gibbs_sampler.py
-# ===========================================================================
+# TEST INDEPENDANT 
 if __name__ == '__main__':
     from config import BETA, TEMPERATURE, N_CLASSES, IMAGE_SIZE, N_ITERATIONS
 

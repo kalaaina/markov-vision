@@ -59,7 +59,8 @@ def synthesize_texture(source_patch, output_size=(128, 128), beta=BETA, T=TEMPER
 
     for i in range(N_ITERATIONS):
         # Appel à la fonction de S3 — c'est elle qui fait le vrai travail
-        labels = gibbs_step(labels, reference_image_rgb, beta, T)
+        # On passe explicitement n_classes pour éviter les incohérences de dimensions si une classe disparaît
+        labels = gibbs_step(labels, reference_image_rgb, beta, T, n_classes=n_classes)
 
         # Affichage de progression toutes les 5 itérations
         if (i + 1) % 5 == 0:

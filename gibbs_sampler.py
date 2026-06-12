@@ -10,6 +10,15 @@ Fonctions exportées :
 import numpy as np
 from config import BETA, TEMPERATURE, N_CLASSES
 
+PALETTE = np.array([
+    [255, 100, 100],  # Classe 0
+    [100, 200, 100],  # Classe 1
+    [100, 150, 255],  # Classe 2
+    [255, 220, 80],   # Classe 3
+    [200, 100, 200],  # Classe 4
+    [180, 180, 180],  # Classe 5
+], dtype=np.uint8)
+
 # 1
 def get_neighbors(labels, i, j):
 #    labels : ndarray 2D (H x W)
@@ -42,11 +51,15 @@ def potts_energy(labels, i, j, candidate, beta):
 
 # 3
 #   P(k) = exp(-E_k / T) / Σ_k' exp(-E_k' / T)
-def gibbs_probabilities(labels, i, j, beta, temperature, n_classes):
+def gibbs_probabilities(labels, i, j, beta, temperature, n_classes, ref_label=None, alpha=2.0):
     energies = np.array([
         potts_energy(labels, i, j, k, beta)
         for k in range(n_classes)
     ])
+
+    if ref_label is not None:
+        # Terme de données : favorise la classe de référence en réduisant son énergie locale
+        energies[ref_label] -= alpha
 
     shifted = energies - energies.min()
     exp_vals = np.exp(-shifted / temperature)
@@ -61,7 +74,7 @@ def gibbs_step(labels, image, beta, temperature, vectorized=True, n_classes=None
     
     Paramètres :
         labels : array (H, W) - carte des classes actuelle
-        image : array (H, W, 3) - image originale (facultative pour Potts pur)
+        image : array (H, W, 3) - image de référence (contenant la texture carrelée)
         beta : float - force de cohésion spatiale
         temperature : float - paramètre de relaxation T
         vectorized : bool - si True, utilise la parallélisation par damier (checkerboard)
@@ -73,6 +86,25 @@ def gibbs_step(labels, image, beta, temperature, vectorized=True, n_classes=None
     if n_classes is None:
         n_classes = labels.max() + 1
 
+    # --- DÉTECTION ET DÉCODAGE DE L'IMAGE DE RÉFÉRENCE (WORKFLOW B) ---
+    is_ref_image = False
+    ref_labels = None
+    if image is not None and image.ndim == 3:
+        # Compter combien de pixels de l'image de référence correspondent aux couleurs de la palette
+        matching_pixels = 0
+        for k in range(min(n_classes, len(PALETTE))):
+            color = PALETTE[k]
+            matching_pixels += np.sum(np.all(image == color, axis=-1))
+        
+        # Si plus de 90% des pixels correspondent, c'est l'image mosaïque de référence
+        if matching_pixels > 0.9 * H * W:
+            is_ref_image = True
+            ref_labels = np.zeros((H, W), dtype=np.int32)
+            for k in range(min(n_classes, len(PALETTE))):
+                color = PALETTE[k]
+                mask = np.all(image == color, axis=-1)
+                ref_labels[mask] = k
+
     if not vectorized:
         # --- CODE D'ORIGINE : BOUCLE PIXEL PAR PIXEL ---
         # Copie pour ne pas modifier le tableau pendant qu'on le lit
@@ -83,8 +115,9 @@ def gibbs_step(labels, image, beta, temperature, vectorized=True, n_classes=None
         np.random.shuffle(indices)
 
         for (i, j) in indices:
-            # Calculer la distribution de probabilité sur les classes
-            probs = gibbs_probabilities(new_labels, i, j, beta, temperature, n_classes)
+            ref_label = ref_labels[i, j] if is_ref_image else None
+            # Calculer la distribution de probabilité sur les classes (avec terme de données si applicable)
+            probs = gibbs_probabilities(new_labels, i, j, beta, temperature, n_classes, ref_label=ref_label)
 
             # Tirer une nouvelle étiquette selon cette distribution
             new_labels[i, j] = np.random.choice(n_classes, p=probs)
@@ -121,6 +154,14 @@ def gibbs_step(labels, image, beta, temperature, vectorized=True, n_classes=None
         # L'énergie de Potts locale est E_k = -beta * counts_k
         # Probabilité P(k) prop à exp(-E_k / T) = exp(beta * counts_k / T)
         logits = counts * (beta / temperature)
+        
+        # Ajouter le terme de données guidant vers la texture d'origine (Workflow B)
+        if is_ref_image:
+            alpha = 2.0  # poids du terme de données
+            data_term = np.zeros((H, W, n_classes), dtype=np.float32)
+            for k in range(n_classes):
+                data_term[:, :, k] = (ref_labels == k) * (alpha / temperature)
+            logits += data_term
         
         # Soustraction du max pour stabilité numérique du softmax
         logits_max = np.max(logits, axis=-1, keepdims=True)

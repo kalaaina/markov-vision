@@ -48,6 +48,47 @@ def _labels_to_rgb(labels, n_classes):
     return rgb
 
 
+def _labels_to_natural_rgb(labels, patch):
+    """Mappe les labels synthétisés aux couleurs naturelles moyennes du patch d'origine.
+    Cela permet à la texture générée de conserver l'apparence naturelle (ex: bois) du patch.
+    """
+    n_classes = int(labels.max() + 1)
+    H, W = labels.shape
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+    
+    # 1. Convertir le patch en niveaux de gris pour reproduire la discrétisation de texture_synth.py
+    if patch.ndim == 3:
+        patch_gray = (0.299 * patch[:, :, 0] +
+                      0.587 * patch[:, :, 1] +
+                      0.114 * patch[:, :, 2]).astype(np.float32)
+    else:
+        patch_gray = patch.astype(np.float32)
+        
+    # 2. Obtenir les tranches de labels du patch d'origine
+    bins = np.linspace(patch_gray.min(), patch_gray.max() + 1, n_classes + 1)
+    patch_labels = np.digitize(patch_gray, bins[:-1]) - 1
+    patch_labels = np.clip(patch_labels, 0, n_classes - 1)
+    
+    # 3. Calculer la couleur moyenne (R, G, B) de chaque classe dans le patch d'origine
+    for k in range(n_classes):
+        mask_patch = (patch_labels == k)
+        if np.sum(mask_patch) > 0:
+            mean_color = patch[mask_patch].mean(axis=0).astype(np.uint8)
+        else:
+            # Fallback si une classe n'a pas de pixels (très rare)
+            palette = [
+                [255, 100, 100], [100, 200, 100], [100, 150, 255],
+                [255, 220, 80], [200, 100, 200], [180, 180, 180]
+            ]
+            mean_color = palette[k % len(palette)]
+            
+        # Appliquer cette couleur naturelle moyenne aux labels correspondants du canevas
+        mask_labels = (labels == k)
+        rgb[mask_labels] = mean_color
+        
+    return rgb
+
+
 def log(msg: str):
     """Append a timestamped message to the UI log (thread-safe)."""
     ts = time.strftime('%H:%M:%S')
@@ -90,6 +131,9 @@ current_labels = None      # Labels au cours du Gibbs
 gibbs_thread = None        # Référence vers le thread Gibbs actif
 abort_event = threading.Event()  # Événement d'annulation du thread
 debounce_timer = None      # ID du timer de debouncing Tkinter
+active_workflow = 'A'      # Canal actif : 'A' (segmentation) ou 'B' (texture)
+current_patch = None       # Patch de texture original pour le Workflow B
+
 
 
 
@@ -276,10 +320,6 @@ def on_slider_changed(val=None):
     """
     global debounce_timer
     
-    # Si aucune image n'est chargée, inutile de lancer l'algorithme
-    if current_image is None or initial_labels is None:
-        return
-        
     # Annuler le timer en cours pour recommencer le debouncing
     if debounce_timer is not None:
         try:
@@ -287,13 +327,21 @@ def on_slider_changed(val=None):
         except Exception:
             pass
             
-    # Planifier le lancement dynamique de Gibbs dans 200 ms
-    debounce_timer = root.after(200, trigger_live_gibbs)
+    # Planifier le lancement dynamique approprié selon le workflow actif
+    if active_workflow == 'A':
+        if current_image is None or initial_labels is None:
+            return
+        debounce_timer = root.after(200, trigger_live_gibbs)
+    elif active_workflow == 'B':
+        if current_patch is None:
+            return
+        debounce_timer = root.after(200, trigger_live_synth)
 
 
 def run_workflow_a():
     """Charge une image, initialise ses labels via K-means, et lance le premier run interactif."""
-    global current_image, initial_labels, current_labels
+    global current_image, initial_labels, current_labels, active_workflow
+    active_workflow = 'A'
     print('Démarrage du Workflow A...')
     
     # Sélection du fichier image
@@ -336,9 +384,86 @@ def run_workflow_a():
     # Déclencher le premier traitement de segmentation
     trigger_live_gibbs()
 
+def trigger_live_synth():
+    """Gère la synthèse de texture dynamique (Workflow B) en tâche de fond de façon thread-safe."""
+    global gibbs_thread, abort_event
+    
+    if current_patch is None:
+        return
+        
+    # Étape 1 : Signaler à l'ancien thread de s'arrêter
+    abort_event.set()
+    
+    # Étape 2 : Attendre que l'ancien thread se termine (court délai)
+    if gibbs_thread is not None and gibbs_thread.is_alive():
+        gibbs_thread.join(timeout=0.25)
+        
+    # Étape 3 : Réinitialiser l'événement d'annulation
+    abort_event.clear()
+    
+    beta = float(slider_beta.get()) if 'slider_beta' in globals() else BETA
+    temperature = float(slider_t.get()) if 'slider_t' in globals() else TEMPERATURE
+    
+    # Étape 4 : Thread de calcul de synthèse de texture
+    def _run_synth():
+        try:
+            log('Démarrage de la synthèse...')
+            
+            # Capture temporaire de stdout
+            import sys
+            class _StdoutToLog:
+                def write(self, s):
+                    s = s.strip()
+                    if s:
+                        log(s)
+                def flush(self):
+                    pass
+                    
+            _old_stdout = sys.stdout
+            sys.stdout = _StdoutToLog()
+            try:
+                # Appel au calcul mathématique de texture_synth
+                labels = texture_synth.synthesize_texture(current_patch, output_size=IMAGE_SIZE, beta=beta, T=temperature)
+            finally:
+                sys.stdout = _old_stdout
+                
+            if abort_event.is_set():
+                return
+                
+            log('Synthèse terminée.')
+
+            # Convertir les labels en image avec les couleurs naturelles moyennes du patch d'origine
+            rgb = _labels_to_natural_rgb(labels, current_patch)
+            im = Image.fromarray(rgb)
+
+            def _update_ui():
+                try:
+                    if abort_event.is_set():
+                        return
+                    # Création de PhotoImage et affichage (sur le thread principal de Tkinter)
+                    photo = build_photo_image(im)
+                    label_image.configure(image=photo, text='')
+                    label_image._img = photo
+                    status_label.configure(text='Terminé')
+                except Exception as ex:
+                    log(f"Erreur d'affichage de la texture: {ex}")
+
+            root.after(0, _update_ui)
+        except Exception as e:
+            if not abort_event.is_set():
+                log(f'Erreur pendant la synthèse: {e}')
+                root.after(0, lambda: messagebox.showerror('Erreur', f"Erreur pendant la synthèse : {e}"))
+
+    gibbs_thread = threading.Thread(target=_run_synth, daemon=True)
+    gibbs_thread.start()
+
+
 def run_workflow_b():
+    """Charge un patch de texture et lance la synthèse en direct."""
+    global active_workflow, current_patch
     print('Démarrage du Workflow B...')
-    # Choisir un patch source pour synthèse
+    
+    # Sélection du patch source
     path = filedialog.askopenfilename(title='Choisir un patch source', filetypes=[('Images', '*.png *.jpg *.jpeg *.bmp')])
     if not path:
         return
@@ -348,6 +473,10 @@ def run_workflow_b():
     except Exception as e:
         messagebox.showerror('Erreur', f"Impossible de charger le patch : {e}")
         return
+
+    # Mettre à jour les variables d'état du workflow
+    active_workflow = 'B'
+    current_patch = patch
 
     # Afficher le patch original dans la colonne de gauche
     hide_energy_plot()
@@ -361,49 +490,8 @@ def run_workflow_b():
 
     log(f'Patch chargé: {os.path.basename(path)}')
 
-    # Lancer la synthèse dans un thread et poster des logs
-    def _run_synth():
-        try:
-            log('Démarrage de la synthèse...')
-            # Capture les prints internes de texture_synth et les redirige vers le log UI
-            import sys
-
-            class _StdoutToLog:
-                def write(self, s):
-                    s = s.strip()
-                    if s:
-                        log(s)
-                def flush(self):
-                    pass
-
-            _old_stdout = sys.stdout
-            sys.stdout = _StdoutToLog()
-            try:
-                labels = texture_synth.synthesize_texture(patch, output_size=IMAGE_SIZE, beta=slider_beta.get() if 'slider_beta' in globals() else BETA, T=slider_t.get() if 'slider_t' in globals() else TEMPERATURE)
-            finally:
-                sys.stdout = _old_stdout
-
-            log('Synthèse terminée.')
-
-            result_image = np.uint8(labels) 
-            
-            im = Image.fromarray(result_image)
-            photo = ImageTk.PhotoImage(im)
-
-            
-
-            def _update_ui():
-                label_image.configure(image=photo, text='')
-                label_image._img = photo
-                status_label.configure(text='Terminé')
-
-            root.after(0, _update_ui)
-        except Exception as e:
-            log(f'Erreur pendant la synthèse: {e}')
-            root.after(0, lambda: messagebox.showerror('Erreur', f"Erreur pendant la synthèse : {e}"))
-
-    threading.Thread(target=_run_synth, daemon=True).start()
-    return
+    # Déclencher le premier traitement de synthèse de texture
+    trigger_live_synth()
 
 
 def ensure_icon_file(icon_path: str) -> str | None:
@@ -608,8 +696,13 @@ def create_ui():
     plot_frame.grid_remove()
 
     # Resize the matplotlib figure when the plot_frame size changes so title and axes scale
+    _in_resize = False
     def _on_plot_resize(event):
+        nonlocal _in_resize
+        if _in_resize:
+            return
         try:
+            _in_resize = True
             dpi = energy_fig.dpi or 100
             w_in = max(1.0, event.width / dpi)
             h_in = max(0.5, event.height / dpi)
@@ -619,18 +712,30 @@ def create_ui():
                 energy_ax.title.set_y(1.05)
             except Exception:
                 pass
-            try:
-                energy_fig.tight_layout()
-            except Exception:
-                pass
             energy_canvas.draw_idle()
         except Exception:
             pass
+        finally:
+            _in_resize = False
 
     plot_frame.bind('<Configure>', _on_plot_resize)
 
-    label_beta = tk.Label(controls_frame, text=LANGUAGES['fr']['beta'], anchor='w', fg=THEMES['dark']['fg'], bg=THEMES['dark']['main_bg'], font=CONTROL_FONT_BOLD)
-    label_beta.grid(row=2, column=0, sticky='ew', pady=(0, 4))
+    # Cadre d'entête horizontal pour Beta avec modification de la plage max
+    beta_header_frame = tk.Frame(controls_frame, bg=THEMES['dark']['main_bg'])
+    beta_header_frame.grid(row=2, column=0, sticky='ew', pady=(0, 4))
+    beta_header_frame.columnconfigure(0, weight=1)
+    beta_header_frame.columnconfigure(1, weight=0)
+    beta_header_frame.columnconfigure(2, weight=0)
+
+    label_beta = tk.Label(beta_header_frame, text=LANGUAGES['fr']['beta'], anchor='w', fg=THEMES['dark']['fg'], bg=THEMES['dark']['main_bg'], font=CONTROL_FONT_BOLD)
+    label_beta.grid(row=0, column=0, sticky='w')
+
+    label_beta_max = tk.Label(beta_header_frame, text="Max:", fg=THEMES['dark']['fg'], bg=THEMES['dark']['main_bg'], font=CONTROL_FONT)
+    label_beta_max.grid(row=0, column=1, sticky='e', padx=(8, 4))
+
+    entry_beta_max = tk.Entry(beta_header_frame, width=5, font=CONTROL_FONT, bg=THEMES['dark']['frame_bg'], fg=THEMES['dark']['fg'], insertbackground=THEMES['dark']['fg'], bd=1, relief='flat')
+    entry_beta_max.insert(0, "5.0")
+    entry_beta_max.grid(row=0, column=2, sticky='e')
 
     slider_beta = tk.Scale(
         controls_frame,
@@ -650,8 +755,33 @@ def create_ui():
     slider_beta.set(1.5)
     slider_beta.grid(row=3, column=0, sticky='ew')
 
-    label_t = tk.Label(controls_frame, text=LANGUAGES['fr']['temperature'], anchor='w', fg=THEMES['dark']['fg'], bg=THEMES['dark']['main_bg'], font=CONTROL_FONT_BOLD)
-    label_t.grid(row=4, column=0, sticky='ew', pady=(12, 4))
+    def update_beta_range(event=None):
+        try:
+            val = float(entry_beta_max.get())
+            if val > 0:
+                slider_beta.configure(to=val)
+        except ValueError:
+            pass
+
+    entry_beta_max.bind('<Return>', update_beta_range)
+    entry_beta_max.bind('<FocusOut>', update_beta_range)
+
+    # Cadre d'entête horizontal pour T avec modification de la plage max
+    t_header_frame = tk.Frame(controls_frame, bg=THEMES['dark']['main_bg'])
+    t_header_frame.grid(row=4, column=0, sticky='ew', pady=(12, 4))
+    t_header_frame.columnconfigure(0, weight=1)
+    t_header_frame.columnconfigure(1, weight=0)
+    t_header_frame.columnconfigure(2, weight=0)
+
+    label_t = tk.Label(t_header_frame, text=LANGUAGES['fr']['temperature'], anchor='w', fg=THEMES['dark']['fg'], bg=THEMES['dark']['main_bg'], font=CONTROL_FONT_BOLD)
+    label_t.grid(row=0, column=0, sticky='w')
+
+    label_t_max = tk.Label(t_header_frame, text="Max:", fg=THEMES['dark']['fg'], bg=THEMES['dark']['main_bg'], font=CONTROL_FONT)
+    label_t_max.grid(row=0, column=1, sticky='e', padx=(8, 4))
+
+    entry_t_max = tk.Entry(t_header_frame, width=5, font=CONTROL_FONT, bg=THEMES['dark']['frame_bg'], fg=THEMES['dark']['fg'], insertbackground=THEMES['dark']['fg'], bd=1, relief='flat')
+    entry_t_max.insert(0, "5.0")
+    entry_t_max.grid(row=0, column=2, sticky='e')
 
     slider_t = tk.Scale(
         controls_frame,
@@ -670,6 +800,17 @@ def create_ui():
     )
     slider_t.set(1.0)
     slider_t.grid(row=5, column=0, sticky='ew')
+
+    def update_t_range(event=None):
+        try:
+            val = float(entry_t_max.get())
+            if val > 0:
+                slider_t.configure(to=val)
+        except ValueError:
+            pass
+
+    entry_t_max.bind('<Return>', update_t_range)
+    entry_t_max.bind('<FocusOut>', update_t_range)
 
     button_frame = tk.Frame(controls_frame, bg=THEMES['dark']['main_bg'])
     button_frame.grid(row=6, column=0, sticky='ew', pady=(16, 5))
@@ -743,8 +884,16 @@ def create_ui():
         controls_frame.configure(bg=t['main_bg'])
         toolbar.configure(bg=t['main_bg'])
         icon_canvas.configure(bg=t['main_bg'])
+        beta_header_frame.configure(bg=t['main_bg'])
         label_beta.configure(bg=t['main_bg'], fg=t['fg'])
+        label_beta_max.configure(bg=t['main_bg'], fg=t['fg'])
+        entry_beta_max.configure(bg=t['frame_bg'], fg=t['fg'], insertbackground=t['fg'])
+
+        t_header_frame.configure(bg=t['main_bg'])
         label_t.configure(bg=t['main_bg'], fg=t['fg'])
+        label_t_max.configure(bg=t['main_bg'], fg=t['fg'])
+        entry_t_max.configure(bg=t['frame_bg'], fg=t['fg'], insertbackground=t['fg'])
+
         slider_beta.configure(bg=t['main_bg'], fg=t['fg'], troughcolor=t['trough'])
         slider_t.configure(bg=t['main_bg'], fg=t['fg'], troughcolor=t['trough'])
         btn_a.configure(bg=t['primary'], activebackground=t['primary_hover'])
